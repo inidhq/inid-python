@@ -43,3 +43,8 @@ include = ["src/inid", "tests", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Django and Flask don't ship type information
+[[tool.mypy.overrides]]
+module = ["django.*", "flask.*", "werkzeug.*"]
+ignore_missing_imports = true
