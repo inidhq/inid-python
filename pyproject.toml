@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inid"
+version = "0.1.0"
+description = "Sign-in with InID for Python servers (Django, FastAPI, Starlette, Flask): the sign-in routes, a fresh session, and paths protected by role or permission."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "InID" }]
+keywords = ["inid", "auth", "authentication", "sign-in", "oidc", "passkeys", "django", "fastapi", "flask"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: Django",
+  "Framework :: FastAPI",
+  "Framework :: Flask",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: WWW/HTTP :: Session",
+  "Typing :: Typed",
+]
+dependencies = ["cryptography>=41"]
+
+[project.optional-dependencies]
+django = ["django>=4.2"]
+fastapi = ["fastapi>=0.100", "starlette>=0.27"]
+flask = ["flask>=2.3"]
+
+[project.urls]
+Homepage = "https://inid.co"
+Documentation = "https://inid.co/docs/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inid"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/inid", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
