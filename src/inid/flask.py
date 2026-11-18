@@ -69,7 +69,9 @@ class InID:
 
     def _before(self) -> Optional[FlaskResponse]:
         assert self.client is not None
-        core = Request(request.method, request.url, {"cookie": request.headers.get("Cookie", "")})
+        # Only InID's own routes read the body (POST team)
+        body = request.get_data() if self.client.is_api_path(request.path) and request.method in ("POST", "PATCH") else b""
+        core = Request(request.method, request.url, {"cookie": request.headers.get("Cookie", "")}, body=body)
         result = self.client.gate(core, self.protect)
         g.inid = result.auth
         g._inid_set_cookies = result.set_cookies
@@ -91,10 +93,15 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def inid_required(
-    view: Optional[F] = None, *, role: Optional[str] = None, permission: Optional[str] = None, entrance: Optional[str] = None
+    view: Optional[F] = None,
+    *,
+    role: Optional[str] = None,
+    permission: Optional[str] = None,
+    entrance: Optional[str] = None,
+    team_role: Optional[str] = None,
 ) -> Any:
-    """@inid_required, or @inid_required(role="admin", permission=..., entrance=...): signs in
-    whoever isn't, and answers 403 to whoever lacks the role or permission."""
+    """@inid_required, or @inid_required(role="admin", permission=..., team_role=..., entrance=...):
+    signs in whoever isn't, and answers 403 to whoever lacks the role, team role or permission."""
 
     def decorate(fn: F) -> F:
         @wraps(fn)
@@ -107,7 +114,7 @@ def inid_required(
                 assert ext.client is not None
                 return_to = request.full_path if request.query_string else request.path
                 return redirect(ext.client.sign_in_url(return_to, entrance))
-            if (role or permission) and not auth.has(role=role, permission=permission):
+            if (role or permission or team_role) and not auth.has(role=role, permission=permission, team_role=team_role):
                 return FlaskResponse("Forbidden", status=403, mimetype="text/plain")
             return fn(*args, **kwargs)
 

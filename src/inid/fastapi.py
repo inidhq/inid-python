@@ -41,7 +41,12 @@ class InIDMiddleware:
             await self.app(scope, receive, send)
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-        request = Request(scope["method"], str(URL(scope=scope)), {"cookie": headers.get("cookie", "")})
+        body = b""
+        # Only InID's own routes read the body (POST team); those answer here, so the app never
+        # needs what was read
+        if self.inid.is_api_path(scope.get("path", "")) and scope["method"] in ("POST", "PATCH"):
+            body = await _read_body(receive)
+        request = Request(scope["method"], str(URL(scope=scope)), {"cookie": headers.get("cookie", "")}, body=body)
         # The core is synchronous (urllib): keep it off the event loop
         result = await run_in_threadpool(self.inid.gate, request, self.protect)
         scope.setdefault("state", {})["inid"] = result.auth
@@ -60,6 +65,22 @@ class InIDMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_cookies)
+
+
+async def _read_body(receive: Receive, limit: int = 64 * 1024) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            break
+        chunk = message.get("body", b"")
+        size += len(chunk)
+        if size <= limit:
+            chunks.append(chunk)
+        if not message.get("more_body"):
+            break
+    return b"".join(chunks) if size <= limit else b""
 
 
 async def _send(response: Response, send: Send) -> None:
@@ -89,13 +110,13 @@ def require_user() -> Callable[[StarletteRequest], User]:
     return dependency
 
 
-def require(role: Optional[str] = None, permission: Optional[str] = None) -> Callable[[StarletteRequest], User]:
-    """Dependency: the signed-in user with this role and/or permission; 401 or 403 otherwise."""
+def require(role: Optional[str] = None, permission: Optional[str] = None, team_role: Optional[str] = None) -> Callable[[StarletteRequest], User]:
+    """Dependency: the signed-in user with this role, team role and/or permission; 401 or 403 otherwise."""
     signed_in = require_user()
 
     def dependency(request: StarletteRequest) -> User:
         user = signed_in(request)
-        if (role or permission) and not user.has(role=role, permission=permission):
+        if (role or permission or team_role) and not user.has(role=role, permission=permission, team_role=team_role):
             raise HTTPException(status_code=403, detail="forbidden")
         return user
 

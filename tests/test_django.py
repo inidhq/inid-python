@@ -138,3 +138,9 @@ def test_flow_cookie_set_through_django_unchanged():
     raw = res.cookies[name].OutputString()
     assert f"Path=/api/inid" in raw and "Max-Age=600" in raw
     assert cookie_named([raw], name)
+
+
+def test_team_route_reads_the_body():
+    res = client(__inid_session=FAKE.id_token(), __inid_refresh="rt").post("/api/inid/team", data={"teamId": "team_1"}, content_type="application/json")
+    assert res.status_code == 200 and res.json()["user"]["team"]["id"] == "team_1"
+    assert FAKE.calls_to("/oauth/token")[-1]["form"]["team"] == "team_1"

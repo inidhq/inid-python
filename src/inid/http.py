@@ -69,12 +69,13 @@ def serialize_cookies(jar: Mapping[str, str]) -> str:
 @dataclass
 class Request:
     """What InID needs of a request: its method, absolute URL and headers (the cookies come
-    from the Cookie header unless given)."""
+    from the Cookie header unless given). body: only InID's own POST/PATCH routes read it."""
 
     method: str
     url: str
     headers: Mapping[str, str] = field(default_factory=dict)
     cookies: Optional[Mapping[str, str]] = None
+    body: bytes = b""
 
     def __post_init__(self) -> None:
         self.method = self.method.upper()

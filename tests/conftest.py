@@ -117,6 +117,12 @@ class FakeInID:
                     raise InIDNetworkError("down")
                 if self.refresh_fails:
                     return answer({"error": "invalid_grant"}, self.refresh_fails)
+                if "team" in form or b"team=" in (body or b""):
+                    asked = form.get("team", "")
+                    if asked and asked != "team_1":
+                        return answer({"error": "not_a_member"}, 403)
+                    team = {"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": ["invoices:write"]} if asked else None
+                    return answer({"id_token": self.id_token(team=team), "refresh_token": "rt_team", "access_token": "at", "expires_in": 600})
                 return answer({"id_token": self.id_token(), "refresh_token": "rt_renewed", "access_token": "at", "expires_in": 600})
         if path == "/oauth/revoke":
             return HTTPResponse(200, b"")
@@ -124,6 +130,12 @@ class FakeInID:
             return answer({"sessions": self.sessions})
         if path.startswith(f"/v1/users/{self.sub}/sessions/") and method == "DELETE":
             return answer({"ended": 1})
+        if path == f"/v1/users/{self.sub}/teams" and method == "GET":
+            return answer({"teams": [{"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin"}]})
+        if path == f"/v1/users/{self.sub}/teams" and method == "POST":
+            return answer({"id": "team_2", **json.loads(body or b"{}")}, 201)
+        if path == f"/v1/users/{self.sub}/teams/boom":
+            return answer({"error": "server_error"}, 500)
         if path == f"/v1/users/{self.sub}" and method == "GET":
             return answer({"id": self.sub, "firstName": "Laura", "role": "member"})
         if path == f"/v1/users/{self.sub}/role" and method == "PUT":
@@ -145,9 +157,9 @@ def make_inid(fake: FakeInID, **settings: Any) -> InID:
     return InID(config, transport=fake.transport, clock=fake.clock)
 
 
-def req(method: str, path: str, cookies: Optional[Mapping[str, str]] = None, origin: str = APP) -> Request:
+def req(method: str, path: str, cookies: Optional[Mapping[str, str]] = None, origin: str = APP, body: bytes = b"") -> Request:
     cookie = "; ".join(f"{k}={v}" for k, v in (cookies or {}).items())
-    return Request(method, origin + path, {"cookie": cookie})
+    return Request(method, origin + path, {"cookie": cookie}, body=body)
 
 
 def cookie_named(set_cookies: list[str], name: str) -> Optional[str]:

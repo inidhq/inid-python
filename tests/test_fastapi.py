@@ -99,3 +99,11 @@ def test_bearer_dependency(client: TestClient, fake: FakeInID):
     assert client.get("/native", headers={"authorization": f"Bearer {fake.id_token()}"}).json() == {"user": "user_123"}
     assert client.get("/native", headers={"authorization": f"Bearer {fake.id_token(ttl=-1)}"}).status_code == 401
     assert client.get("/native").status_code == 401
+
+
+def test_team_route_reads_the_body(client: TestClient, fake: FakeInID):
+    client.cookies.set("__inid_session", fake.id_token())
+    client.cookies.set("__inid_refresh", "rt")
+    res = client.post("/api/inid/team", json={"teamId": "team_1"})
+    assert res.status_code == 200 and res.json()["user"]["team"]["slug"] == "acme"
+    assert fake.calls_to("/oauth/token")[-1]["form"]["team"] == "team_1"

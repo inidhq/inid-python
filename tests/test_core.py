@@ -17,6 +17,8 @@ from inid import (
     InIDError,
     Request,
     Rule,
+    Session,
+    Team,
     User,
     safe_return,
 )
@@ -300,9 +302,13 @@ def test_session_route_json_shape(fake: FakeInID, inid: InID):
             "roles": ["member"],
             "permissions": ["invoices:read"],
             "publicMetadata": {"plan": "pro"},
+            "team": None,
         },
         "accountUrl": f"{ISSUER}/account?client_id={PK}",
     }
+    team = {"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": ["invoices:write"]}
+    res = inid.handle(req("GET", "/api/inid/session", {"__inid_session": fake.id_token(team=team)}))
+    assert res.json()["user"]["team"] == team
 
 
 def test_session_route_signed_out_and_renewing(fake: FakeInID, inid: InID):
@@ -412,12 +418,97 @@ def test_user_has_and_json():
     assert user.has(role="admin") and user.has(permission="a:b") and user.has(role="admin", permission="a:b")
     assert not user.has(role="admin", permission="x") and not user.has(role="x")
     assert user.has()  # neither: a signed-in user is enough
-    assert set(user.to_json()) == {"id", "firstName", "lastName", "name", "email", "emailVerified", "phone", "roles", "permissions", "publicMetadata"}
+    assert set(user.to_json()) == {"id", "firstName", "lastName", "name", "email", "emailVerified", "phone", "roles", "permissions", "publicMetadata", "team"}
     assert User.from_claims({"sub": "u", "given_name": "Ana", "name": "ignored"}).name == "Ana"
     assert User.from_claims({"sub": "u"}).name is None
     anonymous = Auth()
     assert not anonymous.is_signed_in and anonymous.user is None and anonymous.user_id is None
     assert not anonymous.has(role="admin") and not anonymous.has()
+    assert not anonymous.has(team_role="admin")
+
+
+def test_user_team():
+    claims = {
+        "sub": "u1",
+        "roles": ["member"],
+        "permissions": ["invoices:read"],
+        "team": {"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": ["invoices:write", 7]},
+    }
+    user = User.from_claims(claims)
+    assert user.team == Team(id="team_1", slug="acme", name="Acme", role="admin", permissions=("invoices:write",))
+    assert user.to_json()["team"] == {"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": ["invoices:write"]}
+    assert user.has(team_role="admin") and not user.has(team_role="member")
+    # A permission counts from the team's role and from the app role
+    assert user.has(permission="invoices:write") and user.has(permission="invoices:read")
+    assert not user.has(permission="billing:write")
+    assert user.has(role="member", team_role="admin", permission="invoices:write")
+    assert not user.has(role="admin", team_role="admin")
+    assert Auth(Session(user, 0, claims)).has(team_role="admin")
+    # Missing or malformed: no team
+    assert User.from_claims({"sub": "u"}).team is None
+    assert User.from_claims({"sub": "u"}).to_json()["team"] is None
+    assert User.from_claims({"sub": "u", "team": {"id": "t"}}).team is None
+    assert User.from_claims({"sub": "u", "team": {"id": 1, "role": "admin"}}).team is None
+    assert User.from_claims({"sub": "u", "team": ["team_1"]}).team is None
+    bare = User.from_claims({"sub": "u", "team": {"id": "t", "role": "viewer", "slug": 3, "permissions": "x"}}).team
+    assert bare == Team(id="t", slug="", name="", role="viewer", permissions=())
+    no_team = User.from_claims({"sub": "u", "permissions": ["a"]})
+    assert not no_team.has(team_role="admin") and no_team.has(permission="a")
+
+
+def test_gate_team_role_rule(fake: FakeInID, inid: InID):
+    protect = [{"path": "/team-admin", "team_role": "admin"}, Rule("/team-billing", team_role="owner"), {"path": "/write", "teamRole": "admin", "permission": "invoices:write"}]
+    without = {"__inid_session": fake.id_token()}
+    assert inid.gate(req("GET", "/team-admin", without), protect).response.status == 403
+    team = {"id": "team_1", "slug": "acme", "name": "Acme", "role": "admin", "permissions": ["invoices:write"]}
+    within = {"__inid_session": fake.id_token(team=team)}
+    assert inid.gate(req("GET", "/team-admin", within), protect).response is None
+    assert inid.gate(req("GET", "/write", within), protect).response is None
+    assert inid.gate(req("GET", "/team-billing", within), protect).response.status == 403
+
+
+def test_team_route(fake: FakeInID, inid: InID):
+    body = json.dumps({"teamId": "team_1"}).encode()
+    assert inid.handle(req("POST", "/api/inid/team", body=body)).json() == {"error": "not_signed_in"}
+    cookies = {"__inid_session": fake.id_token(), "__inid_refresh": "rt"}
+    res = inid.handle(req("POST", "/api/inid/team", cookies, body=body))
+    assert res.status == 200 and res.json()["user"]["team"]["id"] == "team_1"
+    assert "rt_team" in cookie_named(res.set_cookies, "__inid_refresh")
+    call = fake.calls_to("/oauth/token")[-1]
+    assert call["form"]["team"] == "team_1" and call["form"]["refresh_token"] == "rt"
+    assert call["headers"]["authorization"].startswith("Basic ")
+    # null: back to their own account
+    res = inid.handle(req("POST", "/api/inid/team", cookies, body=b'{"teamId": null}'))
+    assert res.status == 200 and res.json()["user"]["team"] is None
+    assert b"team=" in fake.calls_to("/oauth/token")[-1]["body"]
+    # A team they aren't in: 400, cookies untouched
+    res = inid.handle(req("POST", "/api/inid/team", cookies, body=b'{"teamId": "team_9"}'))
+    assert res.status == 400 and res.json() == {"error": "not_a_member"} and res.set_cookies == []
+    assert inid.handle(req("POST", "/api/inid/team", cookies, body=b'{"teamId": 5}')).status == 400
+    # The session is over at InID
+    fake.refresh_fails = 400
+    res = inid.handle(req("POST", "/api/inid/team", cookies, body=body))
+    assert res.status == 401 and res.json() == {"error": "not_signed_in"}
+    assert "Max-Age=0" in cookie_named(res.set_cookies, "__inid_session")
+
+
+def test_teams_forwarder(fake: FakeInID, inid: InID):
+    assert inid.handle(req("GET", "/api/inid/teams")).status == 401
+    cookies = {"__inid_session": fake.id_token()}
+    res = inid.handle(req("GET", "/api/inid/teams", cookies))
+    assert res.status == 200 and res.json()["teams"][0]["id"] == "team_1"
+    call = fake.calls_to(f"/v1/users/{fake.sub}/teams")[-1]
+    assert call["headers"]["authorization"] == f"Bearer {SK}" and call["body"] is None
+    res = inid.handle(req("POST", "/api/inid/teams", cookies, body=b'{"name":"Beta"}'))
+    assert res.status == 201 and res.json() == {"id": "team_2", "name": "Beta"}
+    assert fake.calls[-1]["headers"]["content-type"] == "application/json"
+    assert inid.handle(req("GET", "/api/inid/teams/team_1/members", cookies)).status == 404  # InID's 404, passed on
+    assert inid.handle(req("GET", "/api/inid/teams/boom", cookies)).status == 502
+    calls = len(fake.calls)
+    assert inid.handle(req("GET", "/api/inid/teams/a/b/c/d/e", cookies)).status == 404
+    assert inid.handle(req("GET", "/api/inid/teams/a.b", cookies)).status == 404
+    assert inid.handle(req("PUT", "/api/inid/teams", cookies)).status == 404
+    assert len(fake.calls) == calls
 
 
 # ---------- 8. ID token verification ----------

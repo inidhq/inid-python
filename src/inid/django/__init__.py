@@ -61,8 +61,11 @@ def get_protect() -> Protect:
     return _settings().get("PROTECT")
 
 
-def _core_request(request: HttpRequest) -> Request:
-    return Request(request.method or "GET", request.build_absolute_uri(), {"cookie": request.META.get("HTTP_COOKIE", "")})
+def _core_request(request: HttpRequest, inid: InID) -> Request:
+    method = request.method or "GET"
+    # Only InID's own routes read the body (POST team)
+    body = request.body if inid.is_api_path(request.path) and method in ("POST", "PATCH") else b""
+    return Request(method, request.build_absolute_uri(), {"cookie": request.META.get("HTTP_COOKIE", "")}, body=body)
 
 
 def apply_cookies(response: HttpResponse, set_cookies: list[str]) -> HttpResponse:
@@ -102,7 +105,7 @@ class InIDMiddleware:
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
         inid = get_inid()
-        result = inid.gate(_core_request(request), get_protect())
+        result = inid.gate(_core_request(request, inid), get_protect())
         request.inid = result.auth  # type: ignore[attr-defined]
         if result.response is not None:
             return to_django_response(result.response)
@@ -117,35 +120,42 @@ class InIDMiddleware:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def _check(request: HttpRequest, role: Optional[str], permission: Optional[str], entrance: Optional[str]) -> Optional[HttpResponse]:
+def _check(
+    request: HttpRequest, role: Optional[str], permission: Optional[str], entrance: Optional[str], team_role: Optional[str] = None
+) -> Optional[HttpResponse]:
     auth: Optional[Auth] = getattr(request, "inid", None)
     if auth is None:
         raise ImproperlyConfigured("inid_required needs inid.django.InIDMiddleware in MIDDLEWARE")
     if not auth.is_signed_in:
         return HttpResponseRedirect(get_inid().sign_in_url(request.get_full_path(), entrance))
-    if (role or permission) and not auth.has(role=role, permission=permission):
+    if (role or permission or team_role) and not auth.has(role=role, permission=permission, team_role=team_role):
         return HttpResponseForbidden("Forbidden")
     return None
 
 
 def inid_required(
-    view: Optional[F] = None, *, role: Optional[str] = None, permission: Optional[str] = None, entrance: Optional[str] = None
+    view: Optional[F] = None,
+    *,
+    role: Optional[str] = None,
+    permission: Optional[str] = None,
+    entrance: Optional[str] = None,
+    team_role: Optional[str] = None,
 ) -> Any:
-    """@inid_required, or @inid_required(role="admin", permission=..., entrance=...): signs in
-    whoever isn't, and answers 403 to whoever lacks the role or permission."""
+    """@inid_required, or @inid_required(role="admin", permission=..., team_role=..., entrance=...):
+    signs in whoever isn't, and answers 403 to whoever lacks the role, team role or permission."""
 
     def decorate(fn: F) -> F:
         if asyncio.iscoroutinefunction(fn):
 
             @wraps(fn)
             async def async_wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
-                return _check(request, role, permission, entrance) or await fn(request, *args, **kwargs)
+                return _check(request, role, permission, entrance, team_role) or await fn(request, *args, **kwargs)
 
             return cast(F, async_wrapper)
 
         @wraps(fn)
         def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
-            return _check(request, role, permission, entrance) or fn(request, *args, **kwargs)
+            return _check(request, role, permission, entrance, team_role) or fn(request, *args, **kwargs)
 
         return cast(F, wrapper)
 

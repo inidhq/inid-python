@@ -41,6 +41,7 @@ DEFAULT_SCOPE = "openid profile email phone"
 
 _SAFE_PATH = re.compile(r"^/(?![/\\])")
 _STATE = re.compile(r"^[\w-]{1,64}$", re.ASCII)
+_TEAMS_REST = re.compile(r"^(/[\w-]{1,80}){0,4}$", re.ASCII)
 
 
 def safe_return(to: Any) -> str:
@@ -106,15 +107,51 @@ class Config:
 # ---------- the user, the session, who is signed in ----------
 
 
-def _allows(user: Optional["User"], role: Optional[str], permission: Optional[str]) -> bool:
-    # Neither role nor permission: someone signed in is enough
+def _allows(user: Optional["User"], role: Optional[str], permission: Optional[str], team_role: Optional[str] = None) -> bool:
+    # None of them: someone signed in is enough. A permission counts from their app role or
+    # their active team's role.
     if user is None:
         return False
     if role and role not in user.roles:
         return False
-    if permission and permission not in user.permissions:
+    if team_role and (user.team is None or user.team.role != team_role):
+        return False
+    if permission and permission not in user.permissions and (user.team is None or permission not in user.team.permissions):
         return False
     return True
+
+
+def _strings(v: Any) -> tuple[str, ...]:
+    return tuple(x for x in v if isinstance(x, str)) if isinstance(v, list) else ()
+
+
+@dataclass(frozen=True)
+class Team:
+    """The person's active team (apps with teams), chosen per session: their role there and
+    what it allows."""
+
+    id: str
+    slug: str = ""
+    name: str = ""
+    role: str = ""
+    permissions: tuple[str, ...] = ()
+
+    @classmethod
+    def from_claim(cls, claim: Any) -> Optional["Team"]:
+        """The ID token's team claim; None when it's missing or malformed."""
+        if not isinstance(claim, dict) or not isinstance(claim.get("id"), str) or not isinstance(claim.get("role"), str):
+            return None
+        slug, name = claim.get("slug"), claim.get("name")
+        return cls(
+            id=claim["id"],
+            slug=slug if isinstance(slug, str) else "",
+            name=name if isinstance(name, str) else "",
+            role=claim["role"],
+            permissions=_strings(claim.get("permissions")),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {"id": self.id, "slug": self.slug, "name": self.name, "role": self.role, "permissions": list(self.permissions)}
 
 
 @dataclass(frozen=True)
@@ -132,14 +169,13 @@ class User:
     roles: tuple[str, ...] = ()
     permissions: tuple[str, ...] = ()
     public_metadata: dict[str, Any] = field(default_factory=dict)
+    # The team they're working in now (apps with teams), with their role there; None: none
+    team: Optional[Team] = None
 
     @classmethod
     def from_claims(cls, claims: Mapping[str, Any]) -> "User":
         def text(v: Any) -> Optional[str]:
             return v if isinstance(v, str) and v else None
-
-        def strings(v: Any) -> tuple[str, ...]:
-            return tuple(x for x in v if isinstance(x, str)) if isinstance(v, list) else ()
 
         first, last = text(claims.get("given_name")), text(claims.get("family_name"))
         metadata = claims.get("public_metadata")
@@ -151,15 +187,17 @@ class User:
             email=text(claims.get("email")),
             email_verified=claims.get("email_verified") is True,
             phone=text(claims.get("phone_number")),
-            roles=strings(claims.get("roles")),
-            permissions=strings(claims.get("permissions")),
+            roles=_strings(claims.get("roles")),
+            permissions=_strings(claims.get("permissions")),
             public_metadata=dict(metadata) if isinstance(metadata, dict) else {},
+            team=Team.from_claim(claims.get("team")),
         )
 
-    def has(self, role: Optional[str] = None, permission: Optional[str] = None) -> bool:
-        """has(role="admin"), has(permission="invoices:read"); both must hold; neither is True
-        (a signed-in user is enough, as for a path-only protect rule)."""
-        return _allows(self, role, permission)
+    def has(self, role: Optional[str] = None, permission: Optional[str] = None, team_role: Optional[str] = None) -> bool:
+        """has(role="admin"), has(permission="invoices:read"), has(team_role="admin"); every one
+        given must hold; none is True (a signed-in user is enough, as for a path-only protect
+        rule). A permission counts from their app role or their active team's role."""
+        return _allows(self, role, permission, team_role)
 
     def to_json(self) -> dict[str, Any]:
         """The same JSON as every InID SDK (camelCase)."""
@@ -174,6 +212,7 @@ class User:
             "roles": list(self.roles),
             "permissions": list(self.permissions),
             "publicMetadata": self.public_metadata,
+            "team": self.team.to_json() if self.team else None,
         }
 
 
@@ -207,8 +246,8 @@ class Auth:
     def user_id(self) -> Optional[str]:
         return self.session.user.id if self.session else None
 
-    def has(self, role: Optional[str] = None, permission: Optional[str] = None) -> bool:
-        return bool(self.user and self.user.has(role=role, permission=permission))
+    def has(self, role: Optional[str] = None, permission: Optional[str] = None, team_role: Optional[str] = None) -> bool:
+        return bool(self.user and self.user.has(role=role, permission=permission, team_role=team_role))
 
     def __bool__(self) -> bool:
         return self.is_signed_in
@@ -219,13 +258,15 @@ class Auth:
 
 @dataclass(frozen=True)
 class Rule:
-    """A path (or pattern) that needs someone signed in, and maybe a role or permission.
-    entrance: the door its sign-in goes through, with that door's rules."""
+    """A path (or pattern) that needs someone signed in, and maybe a role, a role in their
+    active team or a permission. entrance: the door its sign-in goes through, with that door's
+    rules."""
 
     path: Union[str, "re.Pattern[str]"]
     role: Optional[str] = None
     permission: Optional[str] = None
     entrance: Optional[str] = None
+    team_role: Optional[str] = None
 
 
 RuleLike = Union[str, "re.Pattern[str]", Rule, Mapping[str, Any]]
@@ -236,7 +277,13 @@ def as_rule(rule: RuleLike) -> Rule:
     if isinstance(rule, Rule):
         return rule
     if isinstance(rule, Mapping):
-        return Rule(path=rule["path"], role=rule.get("role"), permission=rule.get("permission"), entrance=rule.get("entrance"))
+        return Rule(
+            path=rule["path"],
+            role=rule.get("role"),
+            permission=rule.get("permission"),
+            entrance=rule.get("entrance"),
+            team_role=rule.get("team_role") or rule.get("teamRole"),
+        )
     return Rule(path=rule)
 
 
@@ -421,7 +468,7 @@ class InID:
     # ---------- the routes under api_path ----------
 
     def handle(self, request: Request) -> Response:
-        """The app's routes under api_path: signin, callback, signout, session, sessions."""
+        """The app's routes under api_path: signin, callback, signout, session, sessions, team, teams."""
         try:
             return self._handle(request)
         except InIDError as err:
@@ -546,6 +593,53 @@ class InID:
                     self.transport("DELETE", f"{base}/{quote(ended, safe='')}", as_app, None, 10.0)
                 return _json_response({"ended": len(ending)})
 
+        # The person's active team: POST team {"teamId"} (None: their own account). InID renews
+        # the session with it, so the new cookies (and this answer) say the team.
+        if method == "POST" and action == "team":
+            current = self.session(cookies).session
+            if not current or not cookies.get(REFRESH_COOKIE):
+                return _json_response({"error": "not_signed_in"}, 401)
+            try:
+                given = json.loads(request.body or b"{}")
+            except ValueError:
+                given = {}
+            asked = given.get("teamId") if isinstance(given, dict) else None
+            if asked is not None and not isinstance(asked, str):
+                return _json_response({"error": "invalid_request"}, 400)
+            try:
+                tokens = self._token({"grant_type": "refresh_token", "refresh_token": cookies[REFRESH_COOKIE], "team": asked or ""})
+                renewed = self.verify(tokens["id_token"])
+                if not renewed:
+                    raise InIDError("invalid_id_token", 400)
+            except InIDNetworkError:
+                return _json_response({"error": "inid_unreachable"}, 502)
+            except InIDError as err:
+                # The session itself is over; anything else (a team they aren't in) leaves it as it was
+                if err.code == "invalid_grant":
+                    return _json_response({"error": "not_signed_in"}, 401, cookies=self._clear_cookies(secure))
+                return _json_response({"error": err.code}, 400 if err.status and err.status < 500 else 502)
+            return _json_response({"user": User.from_claims(renewed.claims).to_json()}, cookies=self._session_cookies(tokens, secure))
+
+        # The person's own teams, through the app's server (InID checks what their team role lets
+        # them do): teams, teams/:id, teams/:id/members... -> {issuer}/v1/users/{sub}/teams...
+        if action == "teams" or action.startswith("teams/"):
+            current = self.session(cookies).session
+            if not current:
+                return _json_response({"error": "not_signed_in"}, 401)
+            rest = action[len("teams") :]
+            if not _TEAMS_REST.match(rest) or method not in ("GET", "POST", "PATCH", "DELETE"):
+                return _json_response({"error": "not_found"}, 404)
+            headers = {"authorization": f"Bearer {c.secret_key}", "accept": "application/json"}
+            data = None if method in ("GET", "DELETE") else (request.body or None)
+            if data:
+                headers["content-type"] = "application/json"
+            res = self.transport(method, f"{c.issuer}/v1/users/{quote(current.user.id, safe='')}/teams{rest}", headers, data, 10.0)
+            try:
+                answer = res.json()
+            except ValueError:
+                answer = {"error": "teams_unavailable"}
+            return _json_response(answer, 502 if res.status >= 500 else res.status)
+
         if method == "GET" and action == "session":
             result = self.session(cookies, refresh=True, secure=secure)
             body = {
@@ -585,7 +679,7 @@ class InID:
             to = (c.app_url or request.origin) + self.sign_in_url(return_to, entrance)
             response = Response(307, [("location", to), ("cache-control", "no-store")] + [("set-cookie", x) for x in set_cookies])
             return GateResult(anonymous, response)
-        if session and any(not _allows(session.user, r.role, r.permission) for r in rules):
+        if session and any(not _allows(session.user, r.role, r.permission, r.team_role) for r in rules):
             # Signed in, without the role or permission the path needs
             response = Response(403, [("content-type", "text/plain; charset=utf-8")] + [("set-cookie", x) for x in set_cookies], b"Forbidden")
             return GateResult(Auth(session), response)

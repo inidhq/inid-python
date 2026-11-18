@@ -90,3 +90,9 @@ def test_decorator(client, fake: FakeInID):
     assert jar(client, __inid_session=fake.id_token()).get("/me").get_data(as_text=True) == "Laura Gómez"
     assert jar(client, __inid_session=fake.id_token()).get("/reports").status_code == 403
     assert jar(client, __inid_session=fake.id_token(roles=["admin"])).get("/reports").status_code == 200
+
+
+def test_team_route_reads_the_body(client, fake: FakeInID):
+    res = jar(client, __inid_session=fake.id_token(), __inid_refresh="rt").post("/api/inid/team", json={"teamId": "team_1"})
+    assert res.status_code == 200 and res.get_json()["user"]["team"]["role"] == "admin"
+    assert fake.calls_to("/oauth/token")[-1]["form"]["team"] == "team_1"

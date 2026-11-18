@@ -124,9 +124,16 @@ auth.user             # inid.User or None
 auth.session          # .claims, .expires_at
 auth.has(role="admin")
 auth.has(permission="invoices:read")
+auth.has(team_role="admin")   # their role in their active team
 ```
 
-`User` has `id`, `first_name`, `last_name`, `name`, `email`, `email_verified`, `phone` (E.164), `roles`, `permissions`, `public_metadata`, `has(role=, permission=)` (both must hold; with neither, `True`: being signed in is enough) and `to_json()` with the camelCase keys every InID SDK uses (`firstName`, `emailVerified`, `publicMetadata`…).
+`User` has `id`, `first_name`, `last_name`, `name`, `email`, `email_verified`, `phone` (E.164), `roles`, `permissions`, `public_metadata`, `team`, `has(role=, permission=, team_role=)` (every one given must hold; with none, `True`: being signed in is enough) and `to_json()` with the camelCase keys every InID SDK uses (`firstName`, `emailVerified`, `publicMetadata`, `team`…).
+
+### Teams
+
+In apps with teams, `user.team` is the person's active team (`inid.Team`: `id`, `slug`, `name`, `role`, `permissions`), or `None` when they have none. `has(team_role="admin")` checks their role in that team, and `has(permission=...)` passes when the permission comes from their app role or from their team role. Protect rules and `@inid_required` / `require()` take `team_role` too: `{"path": "/billing", "team_role": "owner"}`.
+
+The browser components switch the active team with `POST /api/inid/team` (`{"teamId": "team_..."}`, or `null` for their own account): InID renews the session with that team and the answer is `{"user": ...}`. `/api/inid/teams/...` forwards the person's own team calls (list, create, members, invitations) to InID with the app's secret key.
 
 ## Webhooks
 
